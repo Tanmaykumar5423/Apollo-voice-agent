@@ -1,0 +1,7 @@
+{
+  "name": "Apollo Hospitals Voice Agent",
+  "description": "A conversational AI voice agent for Apollo Hospitals scheduling and inquiries using Gemini Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
