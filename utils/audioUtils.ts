@@ -58,3 +58,52 @@ export function createPcmBlob(data: Float32Array): Blob {
     mimeType: 'audio/pcm;rate=16000',
   };
 }
+
+export function playAudioCue(ctx: AudioContext, type: 'start' | 'stop' | 'processing') {
+  const t = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+
+  if (type === 'start') {
+    // Cheerful rising chime (C5 -> E5)
+    osc.frequency.setValueAtTime(523.25, t); // C5
+    osc.frequency.exponentialRampToValueAtTime(659.25, t + 0.1); // E5
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.1, t + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+    osc.start(t);
+    osc.stop(t + 0.4);
+  } else if (type === 'stop') {
+    // Gentle falling chime (G4 -> C4)
+    osc.frequency.setValueAtTime(392.00, t); // G4
+    osc.frequency.exponentialRampToValueAtTime(261.63, t + 0.2); // C4
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.1, t + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+    osc.start(t);
+    osc.stop(t + 0.3);
+  } else if (type === 'processing') {
+    // Subtle double blip to indicate computing/action
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(800, t);
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.05, t + 0.02);
+    gain.gain.linearRampToValueAtTime(0, t + 0.08);
+    
+    const osc2 = ctx.createOscillator();
+    const gain2 = ctx.createGain();
+    osc2.connect(gain2);
+    gain2.connect(ctx.destination);
+    osc2.frequency.setValueAtTime(800, t + 0.12);
+    gain2.gain.setValueAtTime(0, t + 0.12);
+    gain2.gain.linearRampToValueAtTime(0.05, t + 0.14);
+    gain2.gain.linearRampToValueAtTime(0, t + 0.20);
+    
+    osc.start(t);
+    osc.stop(t + 0.1);
+    osc2.start(t + 0.12);
+    osc2.stop(t + 0.20);
+  }
+}

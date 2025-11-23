@@ -10,7 +10,8 @@ import {
 import { 
   base64ToUint8Array, 
   createPcmBlob, 
-  decodeAudioData 
+  decodeAudioData,
+  playAudioCue
 } from '../utils/audioUtils';
 import AudioVisualizer from './AudioVisualizer';
 import { ConnectionState } from '../types';
@@ -144,11 +145,14 @@ const VoiceAgent: React.FC = () => {
           onopen: () => {
             console.log('Gemini Live Session Opened');
             setConnectionState(ConnectionState.CONNECTED);
+            playAudioCue(outputCtx, 'start');
           },
           onmessage: async (message: LiveServerMessage) => {
             // Handle Tool Calls
             if (message.toolCall) {
                 console.log("Tool Call received:", message.toolCall);
+                playAudioCue(outputCtx, 'processing');
+                
                 const functionResponses = message.toolCall.functionCalls.map(fc => {
                   let result = {};
                   if (fc.name === 'bookAppointment') {
@@ -253,6 +257,12 @@ const VoiceAgent: React.FC = () => {
   };
 
   const endSession = useCallback(() => {
+    // If we have an active session ref, we can assume we were connected or connecting.
+    // Play stop cue if we have a valid context.
+    if (activeSessionRef.current && outputContextRef.current) {
+        playAudioCue(outputContextRef.current, 'stop');
+    }
+
     stopAudio();
     if (activeSessionRef.current) {
         // @ts-ignore
