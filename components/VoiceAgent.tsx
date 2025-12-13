@@ -1,33 +1,42 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
-import { Mic, MicOff, Phone, PhoneOff, AlertCircle } from 'lucide-react';
+import { Mic, MicOff, Phone, PhoneOff, AlertCircle, CalendarCheck, Loader2, UserRoundSearch, Stethoscope, MapPin, Clock, FileText, Ban, CalendarClock } from 'lucide-react';
 import { 
   APOLLO_SYSTEM_INSTRUCTION, 
   MODEL_NAME, 
-  VOICE_NAME,
-  TOOLS
+  TOOLS,
+  DOCTORS_DATA,
+  MOCK_APPOINTMENTS,
+  MOCK_BILLS
 } from '../constants';
 import { 
   base64ToUint8Array, 
   createPcmBlob, 
-  decodeAudioData,
-  playAudioCue
+  decodeAudioData 
 } from '../utils/audioUtils';
 import AudioVisualizer from './AudioVisualizer';
 import { ConnectionState } from '../types';
+
+interface InfoCardData {
+  type: 'booking' | 'status' | 'bill' | 'cancellation' | 'reschedule';
+  title: string;
+  data: Record<string, string>;
+}
 
 const VoiceAgent: React.FC = () => {
   const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
-  const [bookingConfirmation, setBookingConfirmation] = useState<string | null>(null);
   
-  // Refs for audio handling to avoid re-renders
+  // UI States
+  const [infoCard, setInfoCard] = useState<InfoCardData | null>(null);
+  const [activeDoctor, setActiveDoctor] = useState<typeof DOCTORS_DATA[0] | null>(null);
+  
+  // Refs for audio handling
   const inputContextRef = useRef<AudioContext | null>(null);
   const outputContextRef = useRef<AudioContext | null>(null);
   const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const inputAnalyserRef = useRef<AnalyserNode | null>(null);
   const outputAnalyserRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   
@@ -36,15 +45,12 @@ const VoiceAgent: React.FC = () => {
   const scheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   
   // Live Session
-  const activeSessionRef = useRef<{ close: () => void, sendRealtimeInput: (data: any) => void } | null>(null);
+  const activeSessionRef = useRef<{ close: () => void, sendRealtimeInput: (data: any) => void, sendToolResponse: (data: any) => void } | null>(null);
 
-  // Initialize Audio Contexts
   const initAudioContexts = () => {
-    // Input: 16kHz required for optimal Speech-to-Text in Gemini Live
     if (!inputContextRef.current) {
-      inputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      inputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
-    // Output: 24kHz is the standard rate from Gemini Live Text-to-Speech
     if (!outputContextRef.current) {
       outputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
@@ -63,12 +69,8 @@ const VoiceAgent: React.FC = () => {
       inputSourceRef.current.disconnect();
       inputSourceRef.current = null;
     }
-    
-    // Stop all scheduled output audio
     scheduledSourcesRef.current.forEach(source => {
-      try {
-        source.stop();
-      } catch (e) { /* ignore already stopped */ }
+      try { source.stop(); } catch (e) { /* ignore */ }
     });
     scheduledSourcesRef.current.clear();
     nextStartTimeRef.current = 0;
@@ -76,350 +78,383 @@ const VoiceAgent: React.FC = () => {
 
   const startSession = async () => {
     try {
+      if (connectionState === ConnectionState.CONNECTING || connectionState === ConnectionState.CONNECTED) return;
+
       setConnectionState(ConnectionState.CONNECTING);
       setErrorMessage(null);
-      setBookingConfirmation(null);
+      setInfoCard(null);
+      setActiveDoctor(null);
       
       initAudioContexts();
       const inputCtx = inputContextRef.current!;
       const outputCtx = outputContextRef.current!;
 
-      // Resume contexts if suspended (browser autoplay policy)
       if (inputCtx.state === 'suspended') await inputCtx.resume();
       if (outputCtx.state === 'suspended') await outputCtx.resume();
 
-      // Get Microphone with specific error handling
+      if (!outputAnalyserRef.current) {
+        outputAnalyserRef.current = outputCtx.createAnalyser();
+        outputAnalyserRef.current.fftSize = 256;
+      }
+
       let stream: MediaStream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } 
+        });
+        streamRef.current = stream;
       } catch (err: any) {
-        console.error("Microphone access error:", err);
-        let msg = "Could not access microphone.";
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-             msg = "Microphone permission denied. Please allow access in browser settings.";
-        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-             msg = "No microphone found on your device.";
-        } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-             msg = "Microphone is unavailable. Close other apps using it.";
-        }
-        throw new Error(msg);
+        setErrorMessage("Microphone access denied or not found.");
+        setConnectionState(ConnectionState.ERROR);
+        return;
       }
-      streamRef.current = stream;
 
-      // Setup Input Audio Pipeline
-      const source = inputCtx.createMediaStreamSource(stream);
-      inputSourceRef.current = source;
-      
-      const analyser = inputCtx.createAnalyser();
-      analyser.fftSize = 256;
-      inputAnalyserRef.current = analyser;
-      
-      // Use ScriptProcessor for PCM extraction
-      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-
-      source.connect(analyser);
-      analyser.connect(processor);
-      processor.connect(inputCtx.destination); 
-
-      // Setup Output Analyser
-      const outAnalyser = outputCtx.createAnalyser();
-      outAnalyser.fftSize = 256;
-      outputAnalyserRef.current = outAnalyser;
-      outAnalyser.connect(outputCtx.destination);
-
-      // Initialize Gemini Client
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
       const sessionPromise = ai.live.connect({
         model: MODEL_NAME,
         config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE_NAME } },
-          },
           systemInstruction: APOLLO_SYSTEM_INSTRUCTION,
-          tools: TOOLS
+          tools: TOOLS,
+          responseModalities: [Modality.AUDIO],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
         },
         callbacks: {
-          onopen: () => {
-            console.log('Gemini Live Session Opened');
+          onopen: async () => {
+            console.log("Session opened");
             setConnectionState(ConnectionState.CONNECTED);
-            playAudioCue(outputCtx, 'start');
+            
+            const source = inputCtx.createMediaStreamSource(stream);
+            const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+            
+            processor.onaudioprocess = (e) => {
+              if (isMuted) return;
+              const inputData = e.inputBuffer.getChannelData(0);
+              const pcmBlob = createPcmBlob(inputData, inputCtx.sampleRate);
+              sessionPromise.then(session => session.sendRealtimeInput({ media: pcmBlob }));
+            };
+
+            source.connect(processor);
+            processor.connect(inputCtx.destination);
+            inputSourceRef.current = source;
+            processorRef.current = processor;
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle Tool Calls
             if (message.toolCall) {
-                console.log("Tool Call received:", message.toolCall);
-                playAudioCue(outputCtx, 'processing');
+              const responses: any[] = [];
+              for (const fc of message.toolCall.functionCalls) {
                 
-                const functionResponses = message.toolCall.functionCalls.map(fc => {
-                  let result = {};
-                  if (fc.name === 'bookAppointment') {
-                     const bookingId = "APO-" + Math.floor(1000 + Math.random() * 9000);
-                     console.log(`Booking confirmed for ${fc.args['patientName']} with ID ${bookingId}`);
-                     // Update UI to show success
-                     setBookingConfirmation(`Appointment Confirmed! ID: ${bookingId}`);
-                     
-                     result = { 
-                       bookingId: bookingId,
-                       status: "confirmed", 
-                       message: "Appointment scheduled successfully." 
-                     };
-                  }
-                  return {
-                    id: fc.id,
-                    name: fc.name,
-                    response: { result }
-                  };
-                });
+                // 1. Check Availability
+                if (fc.name === 'checkAvailability') {
+                  const { query } = fc.args as any;
+                  const searchStr = query.toLowerCase();
+                  const found = DOCTORS_DATA.find(d => 
+                    d.name.toLowerCase().includes(searchStr) || 
+                    d.specialty.toLowerCase().includes(searchStr)
+                  );
 
-                sessionPromise.then(session => {
-                    session.sendToolResponse({ functionResponses });
-                });
+                  let result = "No matching doctor found.";
+                  if (found) {
+                    result = `Found: ${found.name} (${found.specialty}) in ${found.location}. Availability: ${found.availability}`;
+                    setActiveDoctor(found);
+                    setInfoCard(null); // Clear other cards
+                  } else {
+                    setActiveDoctor(null);
+                  }
+                  responses.push({ id: fc.id, name: fc.name, response: { result } });
+                }
+                
+                // 2. Book Appointment
+                else if (fc.name === 'bookAppointment') {
+                  const { patientName, doctorOrSpecialty, appointmentDateTime } = fc.args as any;
+                  const bookingId = "AP-" + Math.floor(100000 + Math.random() * 900000);
+                  
+                  setInfoCard({
+                    type: 'booking',
+                    title: 'Appointment Confirmed',
+                    data: {
+                      'Patient': patientName,
+                      'Doctor': doctorOrSpecialty,
+                      'Time': appointmentDateTime,
+                      'Booking ID': bookingId
+                    }
+                  });
+                  setActiveDoctor(null);
+                  responses.push({ id: fc.id, name: fc.name, response: { result: `Success. Booking ID: ${bookingId}.` } });
+                }
+
+                // 3. Check Appointment Status
+                else if (fc.name === 'checkAppointmentStatus') {
+                   const { bookingId } = fc.args as any;
+                   const apt = MOCK_APPOINTMENTS.find(a => a.id === bookingId);
+                   
+                   let result = "Appointment not found.";
+                   if (apt) {
+                      result = `Appointment ${apt.id} is ${apt.status} with ${apt.doctor} at ${apt.time}.`;
+                      setInfoCard({
+                        type: 'status',
+                        title: 'Appointment Status',
+                        data: {
+                          'Status': apt.status,
+                          'Patient': apt.patientName,
+                          'Doctor': apt.doctor,
+                          'Time': apt.time
+                        }
+                      });
+                      setActiveDoctor(null);
+                   }
+                   responses.push({ id: fc.id, name: fc.name, response: { result } });
+                }
+
+                // 4. Cancel Appointment
+                else if (fc.name === 'cancelAppointment') {
+                   const { bookingId } = fc.args as any;
+                   setInfoCard({
+                     type: 'cancellation',
+                     title: 'Appointment Cancelled',
+                     data: { 'Booking ID': bookingId, 'Status': 'Cancelled' }
+                   });
+                   responses.push({ id: fc.id, name: fc.name, response: { result: `Appointment ${bookingId} cancelled.` } });
+                }
+
+                // 5. Reschedule Appointment
+                else if (fc.name === 'rescheduleAppointment') {
+                   const { bookingId, newDateTime } = fc.args as any;
+                   setInfoCard({
+                     type: 'reschedule',
+                     title: 'Appointment Rescheduled',
+                     data: { 'Booking ID': bookingId, 'New Time': newDateTime, 'Status': 'Confirmed' }
+                   });
+                   responses.push({ id: fc.id, name: fc.name, response: { result: `Appointment ${bookingId} rescheduled to ${newDateTime}.` } });
+                }
+
+                // 6. Check Bill
+                else if (fc.name === 'checkBill') {
+                    const { invoiceId } = fc.args as any;
+                    const bill = MOCK_BILLS.find(b => b.id === invoiceId);
+                    
+                    let result = "Invoice not found.";
+                    if (bill) {
+                        result = `Invoice ${bill.id} total is ${bill.amount}. Details: ${bill.details}`;
+                        setInfoCard({
+                            type: 'bill',
+                            title: 'Invoice Details',
+                            data: {
+                                'Invoice ID': bill.id,
+                                'Amount': bill.amount,
+                                'Breakdown': bill.details
+                            }
+                        });
+                        setActiveDoctor(null);
+                    }
+                    responses.push({ id: fc.id, name: fc.name, response: { result } });
+                }
+              }
+              
+              if (responses.length > 0) {
+                 const session = await sessionPromise;
+                 session.sendToolResponse({ functionResponses: responses });
+              }
             }
 
-            // Handle Audio Output
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
-              const pcmData = base64ToUint8Array(base64Audio);
-              const audioBuffer = await decodeAudioData(pcmData, outputCtx, 24000, 1);
-              
-              // Schedule playback
-              const now = outputCtx.currentTime;
-              const startTime = Math.max(now, nextStartTimeRef.current);
-              
-              const sourceNode = outputCtx.createBufferSource();
-              sourceNode.buffer = audioBuffer;
-              sourceNode.connect(outAnalyser);
-              
-              sourceNode.start(startTime);
-              nextStartTimeRef.current = startTime + audioBuffer.duration;
-              
-              scheduledSourcesRef.current.add(sourceNode);
-              sourceNode.onended = () => {
-                scheduledSourcesRef.current.delete(sourceNode);
-              };
+              try {
+                const audioBuffer = await decodeAudioData(base64ToUint8Array(base64Audio), outputCtx);
+                const currentTime = outputCtx.currentTime;
+                let startTime = nextStartTimeRef.current < currentTime ? currentTime : nextStartTimeRef.current;
+                
+                const source = outputCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(outputAnalyserRef.current!);
+                outputAnalyserRef.current!.connect(outputCtx.destination);
+                source.start(startTime);
+                
+                nextStartTimeRef.current = startTime + audioBuffer.duration;
+                scheduledSourcesRef.current.add(source);
+                source.onended = () => scheduledSourcesRef.current.delete(source);
+              } catch (e) { console.error(e); }
             }
-
-            // Handle Interruption
+            
             if (message.serverContent?.interrupted) {
-                console.log('Model interrupted');
-                scheduledSourcesRef.current.forEach(src => {
-                    try { src.stop(); } catch (e) {}
-                });
-                scheduledSourcesRef.current.clear();
-                nextStartTimeRef.current = outputCtx.currentTime;
+               scheduledSourcesRef.current.forEach(s => { try { s.stop(); } catch(e){} });
+               scheduledSourcesRef.current.clear();
+               nextStartTimeRef.current = outputCtx.currentTime;
             }
           },
-          onclose: (e) => {
-            console.log('Session Closed', e);
-            if (connectionState === ConnectionState.CONNECTED) {
-               setConnectionState(ConnectionState.DISCONNECTED);
-            }
-          },
-          onerror: (e) => {
-            console.error('Session Error', e);
-            setErrorMessage("Connection interrupted. Please check your network and try again.");
-            setConnectionState(ConnectionState.ERROR);
-            stopAudio();
-          }
+          onclose: () => { setConnectionState(ConnectionState.DISCONNECTED); stopAudio(); },
+          onerror: (err) => { setErrorMessage("Connection interrupted."); setConnectionState(ConnectionState.ERROR); stopAudio(); }
         }
       });
       
-      // Catch initial connection failures (e.g. invalid API key, network issues)
-      sessionPromise.catch(err => {
-         console.error("Connection failed:", err);
-         setErrorMessage("Unable to connect to Apollo AI service. Please check your connection.");
-         setConnectionState(ConnectionState.ERROR);
-         stopAudio();
-      });
+      const session = await sessionPromise;
+      activeSessionRef.current = session;
 
-      // Hook up audio processor to session input
-      processor.onaudioprocess = (e) => {
-        if (isMuted) return; 
-
-        const inputData = e.inputBuffer.getChannelData(0);
-        const pcmBlob = createPcmBlob(inputData);
-        
-        sessionPromise.then(session => {
-            activeSessionRef.current = session;
-            session.sendRealtimeInput({ media: pcmBlob });
-        });
-      };
-
-    } catch (err: any) {
-      console.error(err);
-      setErrorMessage(err.message || "Failed to initialize voice session.");
+    } catch (error: any) {
+      setErrorMessage("Failed to connect to Apollo Assist.");
       setConnectionState(ConnectionState.ERROR);
       stopAudio();
     }
   };
 
-  const endSession = useCallback(() => {
-    // If we have an active session ref, we can assume we were connected or connecting.
-    // Play stop cue if we have a valid context.
-    if (activeSessionRef.current && outputContextRef.current) {
-        playAudioCue(outputContextRef.current, 'stop');
-    }
-
-    stopAudio();
+  const endSession = () => {
     if (activeSessionRef.current) {
-        // @ts-ignore
-        activeSessionRef.current.close?.(); 
-        activeSessionRef.current = null;
+      activeSessionRef.current.close();
+      activeSessionRef.current = null;
     }
+    stopAudio();
     setConnectionState(ConnectionState.DISCONNECTED);
-  }, []);
-
-  const toggleMute = () => {
-    setIsMuted(!isMuted);
   };
+
+  const toggleMute = () => setIsMuted(!isMuted);
 
   useEffect(() => {
     return () => {
       endSession();
+      if (inputContextRef.current?.state !== 'closed') inputContextRef.current?.close();
+      if (outputContextRef.current?.state !== 'closed') outputContextRef.current?.close();
     };
-  }, [endSession]);
+  }, []);
 
-  const isConnected = connectionState === ConnectionState.CONNECTED;
-  const isConnecting = connectionState === ConnectionState.CONNECTING;
+  const getCardIcon = (type: string) => {
+      switch(type) {
+          case 'booking': return <CalendarCheck size={24} />;
+          case 'bill': return <FileText size={24} />;
+          case 'cancellation': return <Ban size={24} />;
+          case 'reschedule': return <CalendarClock size={24} />;
+          default: return <AlertCircle size={24} />;
+      }
+  };
+
+  const getCardColor = (type: string) => {
+      switch(type) {
+          case 'booking': return 'bg-teal-600';
+          case 'bill': return 'bg-indigo-600';
+          case 'cancellation': return 'bg-red-500';
+          case 'reschedule': return 'bg-orange-500';
+          default: return 'bg-blue-600';
+      }
+  };
 
   return (
-    <div className="flex flex-col items-center justify-center w-full max-w-3xl mx-auto p-6">
-      
-      {/* Status Card */}
-      <div className="w-full bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-100">
-        <div className="bg-slate-50 p-6 text-center border-b border-slate-100">
-          <h2 className="text-2xl font-bold text-slate-800 mb-2">Apollo Assist</h2>
-          <p className="text-slate-500 max-w-lg mx-auto">
-            Schedule appointments, check insurance, or ask about our services. 
-            Speak naturally—I am here to help.
-          </p>
-        </div>
-
-        <div className="p-8 flex flex-col items-center gap-8 min-h-[400px] justify-center relative bg-gradient-to-b from-white to-slate-50">
+    <div className="flex flex-col items-center w-full max-w-2xl gap-6">
+      {/* Visualizer Card */}
+      <div className="relative w-full">
+        <div className="absolute inset-0 bg-gradient-to-r from-teal-500/20 to-blue-500/20 rounded-2xl blur-xl" />
+        <div className="relative bg-white/80 backdrop-blur-md rounded-2xl p-6 shadow-xl border border-white/50">
+          <div className="flex items-center justify-between mb-4">
+             <div className="flex items-center gap-2">
+               <span className={`w-3 h-3 rounded-full ${connectionState === ConnectionState.CONNECTED ? 'bg-green-500 animate-pulse' : 'bg-slate-300'}`} />
+               <span className="text-sm font-semibold text-slate-600">
+                 {connectionState === ConnectionState.CONNECTED ? 'Apollo Assist Active' : 'Offline'}
+               </span>
+             </div>
+             {connectionState === ConnectionState.CONNECTED && (
+               <div className="text-xs text-slate-400 font-mono">LIVE 24kHz</div>
+             )}
+          </div>
           
-          {/* Visualizer Area */}
-          <div className="w-full relative flex items-center justify-center">
-            {isConnected ? (
-              <div className="w-full space-y-4">
-                 <div className="flex justify-between items-center px-4">
-                     <span className="text-xs font-semibold text-teal-600 uppercase tracking-wider">Input (Mic)</span>
-                     <span className="text-xs font-semibold text-orange-600 uppercase tracking-wider">Output (Agent)</span>
-                 </div>
-                 <div className="relative">
-                    <AudioVisualizer analyser={outputAnalyserRef.current} isActive={isConnected} color="#ea580c" />
-                    <div className="absolute top-0 left-0 w-full opacity-50 mix-blend-multiply">
-                        <AudioVisualizer analyser={inputAnalyserRef.current} isActive={isConnected && !isMuted} color="#0d9488" />
-                    </div>
-                 </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center h-48 w-full border-2 border-dashed border-slate-200 rounded-xl bg-slate-50/50">
-                 {isConnecting ? (
-                    <div className="animate-pulse flex flex-col items-center">
-                        <div className="h-4 w-4 bg-teal-500 rounded-full mb-2 animate-bounce"></div>
-                        <span className="text-slate-400 font-medium">Connecting to Apollo Secure Server...</span>
-                    </div>
-                 ) : (
-                    <div className="text-slate-400 font-medium flex flex-col items-center gap-2">
-                        <div className="p-4 bg-white rounded-full shadow-sm">
-                            <ActivityIcon />
-                        </div>
-                        <span>Ready to assist you</span>
-                    </div>
-                 )}
-              </div>
-            )}
-          </div>
+          <AudioVisualizer 
+            analyser={outputAnalyserRef.current} 
+            isActive={connectionState === ConnectionState.CONNECTED} 
+            color="#0f766e" 
+          />
 
-          {/* Messages/Feedback */}
-          {errorMessage && (
-            <div className="flex items-center gap-2 text-red-600 bg-red-50 px-4 py-2 rounded-lg text-sm animate-fade-in text-center max-w-lg">
-              <AlertCircle size={16} className="shrink-0" />
-              <span>{errorMessage}</span>
-            </div>
-          )}
-
-          {bookingConfirmation && (
-            <div className="flex items-center gap-2 text-green-700 bg-green-50 px-6 py-3 rounded-xl text-md font-semibold border border-green-200 animate-fade-in shadow-sm">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path></svg>
-              <span>{bookingConfirmation}</span>
-            </div>
-          )}
-
-          {/* Controls */}
-          <div className="flex items-center gap-6 mt-4">
-            {!isConnected ? (
-              <button
-                onClick={startSession}
-                disabled={isConnecting}
-                className={`
-                  flex items-center gap-3 px-8 py-4 rounded-full font-bold text-lg shadow-lg hover:shadow-xl transition-all transform hover:-translate-y-0.5
-                  ${isConnecting 
-                    ? 'bg-slate-200 text-slate-400 cursor-not-allowed' 
-                    : 'bg-gradient-to-r from-teal-600 to-teal-500 text-white hover:from-teal-500 hover:to-teal-400'}
-                `}
-              >
-                <Phone size={24} />
-                {isConnecting ? 'Connecting...' : 'Start Conversation'}
-              </button>
-            ) : (
-              <>
-                <button
-                  onClick={toggleMute}
-                  className={`
-                    p-5 rounded-full shadow-lg transition-all border-2 
-                    ${isMuted 
-                      ? 'bg-red-50 border-red-200 text-red-500 hover:bg-red-100' 
-                      : 'bg-white border-slate-100 text-slate-700 hover:bg-slate-50'}
-                  `}
-                  title={isMuted ? "Unmute" : "Mute"}
-                >
-                  {isMuted ? <MicOff size={24} /> : <Mic size={24} />}
-                </button>
-
-                <button
-                  onClick={endSession}
-                  className="px-8 py-4 bg-red-500 hover:bg-red-600 text-white rounded-full font-bold text-lg shadow-lg hover:shadow-xl transition-all flex items-center gap-3"
-                >
-                  <PhoneOff size={24} />
-                  End Call
-                </button>
-              </>
-            )}
+          <div className="flex justify-center items-center gap-6 mt-6">
+             {connectionState === ConnectionState.DISCONNECTED || connectionState === ConnectionState.ERROR ? (
+               <button 
+                 onClick={startSession}
+                 className="flex items-center gap-2 px-8 py-3 bg-gradient-to-r from-orange-500 to-orange-600 hover:from-orange-600 hover:to-orange-700 text-white rounded-full font-bold shadow-lg shadow-orange-500/30 transition-all transform hover:scale-105"
+               >
+                 <Phone size={20} />
+                 Start Consultation
+               </button>
+             ) : (
+               <>
+                 <button 
+                   onClick={toggleMute}
+                   className={`p-4 rounded-full transition-all ${isMuted ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
+                 >
+                   {isMuted ? <MicOff size={24} /> : <Mic size={24} />}
+                 </button>
+                 <button 
+                   onClick={endSession}
+                   className="p-4 rounded-full bg-red-500 text-white hover:bg-red-600 shadow-lg shadow-red-500/30 transition-all transform hover:scale-105"
+                 >
+                   <PhoneOff size={24} />
+                 </button>
+               </>
+             )}
           </div>
         </div>
       </div>
+
+      {/* Doctor Profile Card */}
+      {activeDoctor && !infoCard && (
+        <div className="w-full animate-in fade-in slide-in-from-bottom-4 duration-500">
+          <div className="bg-white rounded-xl shadow-md border border-slate-200 p-5 flex items-start gap-4">
+            <div className="bg-blue-100 p-3 rounded-full text-blue-600">
+              <UserRoundSearch size={32} />
+            </div>
+            <div className="flex-1">
+              <h3 className="text-lg font-bold text-slate-900">{activeDoctor.name}</h3>
+              <div className="flex items-center gap-2 text-slate-600 text-sm mb-2">
+                <Stethoscope size={14} />
+                <span>{activeDoctor.specialty}</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm text-slate-500">
+                <div className="flex items-center gap-2">
+                   <MapPin size={14} />
+                   <span>{activeDoctor.location}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                   <Clock size={14} />
+                   <span>{activeDoctor.availability}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* General Info Card (Booking, Status, Bill, Cancellation, Reschedule) */}
+      {infoCard && (
+        <div className="w-full animate-in fade-in slide-in-from-bottom-4 duration-700">
+          <div className="bg-white rounded-xl shadow-lg border border-slate-100 overflow-hidden">
+            <div className={`${getCardColor(infoCard.type)} px-6 py-4 flex items-center gap-3 text-white`}>
+              {getCardIcon(infoCard.type)}
+              <h3 className="font-bold text-lg">{infoCard.title}</h3>
+            </div>
+            <div className="p-6 grid gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {Object.entries(infoCard.data).map(([key, value]) => (
+                    <div key={key}>
+                        <p className="text-sm text-slate-500 mb-1">{key}</p>
+                        <p className="font-medium text-slate-900">{value}</p>
+                    </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Error Message */}
+      {errorMessage && (
+        <div className="flex items-center gap-2 p-4 w-full bg-red-50 text-red-700 rounded-lg border border-red-100 animate-in fade-in">
+          <AlertCircle size={20} />
+          <p className="text-sm font-medium">{errorMessage}</p>
+        </div>
+      )}
       
-      {/* Information Cards */}
-      <div className="grid md:grid-cols-3 gap-4 w-full mt-8">
-        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-100">
-           <div className="w-8 h-8 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mb-3 font-bold">1</div>
-           <h3 className="font-semibold text-slate-800 mb-1">Book Appointments</h3>
-           <p className="text-sm text-slate-500">Find the right specialist and schedule a time that works for you.</p>
-        </div>
-        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-100">
-           <div className="w-8 h-8 bg-purple-100 text-purple-600 rounded-full flex items-center justify-center mb-3 font-bold">2</div>
-           <h3 className="font-semibold text-slate-800 mb-1">Check Insurance</h3>
-           <p className="text-sm text-slate-500">Instantly verify if your provider is accepted at our clinics.</p>
-        </div>
-        <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-100">
-           <div className="w-8 h-8 bg-orange-100 text-orange-600 rounded-full flex items-center justify-center mb-3 font-bold">3</div>
-           <h3 className="font-semibold text-slate-800 mb-1">General Inquiries</h3>
-           <p className="text-sm text-slate-500">Ask about visiting hours, parking, or specific medical procedures.</p>
-        </div>
-      </div>
-
+      {connectionState === ConnectionState.CONNECTING && (
+         <div className="text-slate-500 flex items-center gap-2 text-sm">
+           <Loader2 size={16} className="animate-spin" />
+           Connecting to secure medical line...
+         </div>
+      )}
     </div>
   );
 };
-
-const ActivityIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-slate-300">
-     <path d="M22 12H18L15 21L9 3L6 12H2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-  </svg>
-)
 
 export default VoiceAgent;

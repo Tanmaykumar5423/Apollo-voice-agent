@@ -11,7 +11,7 @@ const Header: React.FC = () => {
           </div>
           <div>
             <h1 className="text-xl font-bold text-slate-900 tracking-tight">Apollo Hospitals</h1>
-            <p className="text-xs text-slate-500 font-medium tracking-wide">EXCELLENCE MEETS COMPASSION</p>
+            <p className="text-xs text-slate-500 font-medium tracking-wide">WHERE EXCELLENCE MEETS COMPASSION</p>
           </div>
         </div>
         <nav className="hidden md:flex gap-6 text-sm font-medium text-slate-600">
